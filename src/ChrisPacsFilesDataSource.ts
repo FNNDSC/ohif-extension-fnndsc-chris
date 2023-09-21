@@ -1,4 +1,4 @@
-import ChrisAndPfdcmClient from './client';
+import ChrisAndPfdcmClient, { PypxSeriesMetadata } from './client';
 import { DicomMetadataStore, IWebApiDataSource, utils, errorHandler, classes } from '@ohif/core';
 
 
@@ -8,8 +8,9 @@ function createChrisPacsDataSource() {
   const pfdcmUrl = 'http://localhost:4005'
   const pfdcmService = 'orthanc';
   const cubeUrl = 'http://localhost:8000/api/v1/';
-  const cubeToken = 'c615cc32850c603b34d08a5e0d189e5b65ec310d'
-  const client = new ChrisAndPfdcmClient(cubeUrl, cubeToken, pfdcmUrl, pfdcmService);
+  const cubeToken = 'c615cc32850c603b34d08a5e0d189e5b65ec310d';
+  const pypxfsServer = 'http://localhost:4080';
+  const client = new ChrisAndPfdcmClient(cubeUrl, cubeToken, pfdcmUrl, pfdcmService, pypxfsServer);
 
   return {
     initialize: ({ params, query }) => {
@@ -38,15 +39,22 @@ function createChrisPacsDataSource() {
       series: {
         // retrieve.series.metadata tells OHIF the CUBE URLs of DICOM instances of a study
         metadata: async ({ StudyInstanceUID = null, madeInClient = false} = {}) => {
-          console.log('getting metadata...');
+          // ls /home/dicom/log/studyData/X.X.X.XXXXXXXXX-series/
+          const seriesInstanceUids = await client.lsSeries(StudyInstanceUID);
 
-          const instancesData = await client.getInstances(StudyInstanceUID);
+          const seriesMetas = await Promise.all(seriesInstanceUids.map((SeriesInstanceUID) => {
+            // cat /home/dicom/log/studyData/X.X.X.XXXXXXXXX-series/X.X.X.XXXXXXXXX-meta.json
+            return client.getSeriesMeta(StudyInstanceUID, SeriesInstanceUID)
+          }));
 
-          const seriesSummaryMetadata = cubePacsfilesToSeriesSummaryMetadata(instancesData);
-          DicomMetadataStore.addSeriesMetadata(seriesSummaryMetadata, madeInClient);
-
-          const naturalizedInstances = instancesData.map(cubePacsfileToNaturalizedInstance);
-          DicomMetadataStore.addInstances(naturalizedInstances, madeInClient);
+          const promises = seriesMetas.map((seriesMeta) => {
+            return getNaturalizedInstances(client, seriesMeta).then((naturalizedInstances) => {
+              console.log('calling DicomMetadataStore.addInstances');
+              console.dir(naturalizedInstances);
+              DicomMetadataStore.addInstances(naturalizedInstances, madeInClient);
+            })
+          });
+          await Promise.all(promises);
         }
       }
     },
@@ -131,44 +139,44 @@ function cubePacsfileToSeriesSummaryMetadata(pacsfile) {
   }
 }
 
-function cubePacsfileToNaturalizedInstance(pacsfile) {
-  const url = `dicomweb:${pacsfile.file_resource}`;
-  return {
-    // "Columns": 512,
-    // "Rows": 512,
-    // "InstanceNumber": 1,
-    // "SOPClassUID": "1.2.840.10008.5.1.4.1.1.2",
-    // "PhotometricInterpretation": "MONOCHROME2",
-    // "BitsAllocated": 16,
-    // "BitsStored": 16,
-    // "PixelRepresentation": 1,
-    // "SamplesPerPixel": 1,
-    // "PixelSpacing": [0.703125, 0.703125],
-    // "HighBit": 15,
-    // "ImageOrientationPatient": [1, 0, 0, 0, 1, 0],
-    // "ImagePositionPatient": [-166, -171.699997, -10],
-    // "FrameOfReferenceUID": "1.3.6.1.4.1.14519.5.2.1.6279.6001.229925374658226729607867499499",
-    // "ImageType": ["ORIGINAL", "PRIMARY", "AXIAL"],
-    "Modality": pacsfile.Modality,
-    // "SOPInstanceUID": "1.3.6.1.4.1.14519.5.2.1.6279.6001.262721256650280657946440242654",
-    "SeriesInstanceUID": pacsfile.SeriesInstanceUID,
-    "StudyInstanceUID": pacsfile.StudyInstanceUID,
-    // "WindowCenter": -600,
-    // "WindowWidth": 1600,
-    "SeriesDate": pacsfile.StudyDate.replaceAll('-', ''),
-    "url": url,
-    "imageId": url,
-    // "SeriesNumber": 3000566,
-    // "SliceThickness": 2.5,
-    "StudyDate": pacsfile.StudyDate.replaceAll('-', ''),
-    "StudyTime": "",
-    "PatientName": pacsfile.PatientName,
-    "PatientID": pacsfile.PatientID,
-    "AccessionNumber": pacsfile.AccessionNumber,
-    "PatientAge": pacsfile.PatientAge,
-    "PatientSex": pacsfile.PatientSex,
-    // "NumInstances": 0, // TODO
-    "Modalities": pacsfile.Modality
+async function getNaturalizedInstances(client: ChrisAndPfdcmClient, studyMeta: PypxSeriesMetadata): Promise<any[]> {
+  console.debug(studyMeta);
+  const instances = await client.getInstances(studyMeta.SeriesBaseDir);
+  return instances.map((instance) => {
+    const url = 'dicomweb:' + instance.url;
+    return {
+      Columns: studyMeta.DICOM.Columns.value,
+      Rows: studyMeta.DICOM.Rows.value,
+      InstanceNumber: instance.number,
+      SOPClassUID: studyMeta.DICOM.SOPClassUID.value,
+
+      // TODO LEFT OFF HERE
+
+      ImageType: studyMeta.DICOM.ImageType.value,
+      Modality: studyMeta.DICOM.Modality.value,
+      SOPInstanceUID: studyMeta.DICOM.SOPInstanceUID.value,
+      SeriesInstanceUID: studyMeta.DICOM.SeriesInstanceUID.value,
+      StudyInstanceUID: studyMeta.DICOM.StudyInstanceUID.value,
+
+
+      url: url,
+      imageId: url,
+      NumInstances: instances.length,
+
+    };
+  });
+}
+
+function serializePypxDicomTags(data) {
+  const entries = Object.values(data).map(tag => [tag.label, tryParseJson(tag.value)]);
+  return Object.fromEntries(entries);
+}
+
+function tryParseJson(data) {
+  try {
+    return JSON.parse(data);
+  } catch (e) {
+    return data;
   }
 }
 
